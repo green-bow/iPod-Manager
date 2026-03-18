@@ -19,6 +19,8 @@ from urllib.parse import urlparse, parse_qs, unquote
 from socketserver import ThreadingMixIn
 import cgi
 import time
+import atexit
+import signal
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
@@ -107,7 +109,8 @@ def find_duplicates(ipod_path):
     music_dir = os.path.join(ipod_path, 'iPod_Control', 'Music')
     by_hash = {}
     for dirpath, dirnames, filenames in os.walk(music_dir):
-        dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+        # Walk into subdirectories but skip hidden ones EXCEPT for our .staging folder
+        dirnames[:] = [d for d in dirnames if not d.startswith('.') or d == STAGING_FOLDER]
         for filename in filenames:
             if filename.startswith('.'):
                 continue
@@ -154,14 +157,21 @@ def get_song_info(path):
     return title, artist, album, duration_str
 
 def cleanup_staging(ipod_path):
-    """Remove the staging folder and invalidate duplicate cache."""
+    """Remove the staging folder and invalidate duplicate cache.
+    Retries multiple times in case files are locked (common on Windows)."""
     global _dup_cache
     _dup_cache = None
     
     staging = os.path.join(ipod_path, 'iPod_Control', 'Music', STAGING_FOLDER)
     if os.path.isdir(staging):
-        shutil.rmtree(staging, ignore_errors=True)
-        logger.info('Staging folder cleared.')
+        for _ in range(5):
+            try:
+                shutil.rmtree(staging)
+                logger.info('Staging folder cleared.')
+                return
+            except Exception:
+                time.sleep(0.2)
+        logger.warning('Failed to clear staging folder (files might be in use).')
 
 def scan_songs(ipod_path):
     """Walk the iPod and return list of song dicts with staged + duplicate flags.
@@ -340,7 +350,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({'logs': logger.get_logs()})
         elif path == '/api/storage':
             total, used, free = shutil.disk_usage(self.ipod_path)
-            self.send_json({'total': total, 'used': used, 'free': free})
+            # Calculate size of staged files
+            staged_size = 0
+            staging_dir = os.path.join(self.ipod_path, 'iPod_Control', 'Music', STAGING_FOLDER)
+            if os.path.isdir(staging_dir):
+                for dirpath, _, filenames in os.walk(staging_dir):
+                    for f in filenames:
+                        fp = os.path.join(dirpath, f)
+                        try:
+                            staged_size += os.path.getsize(fp)
+                        except OSError: pass
+            self.send_json({'total': total, 'used': used, 'free': free, 'staged_size': staged_size})
         else:
             self.send_response(404)
             self.end_headers()
@@ -801,7 +821,8 @@ async function loadStorage() {
     };
     const freeStr = formatBytes(data.free);
     const totalStr = formatBytes(data.total);
-    document.getElementById('storageInfo').innerHTML = `Available storage: ${freeStr} &nbsp;&nbsp; Available after sync: ${freeStr} &nbsp;&nbsp; Total storage size: ${totalStr}`;
+    const afterSyncStr = formatBytes(Math.max(0, data.free - (data.staged_size || 0)));
+    document.getElementById('storageInfo').innerHTML = `Available storage: ${freeStr} &nbsp;&nbsp; Available after sync: ${afterSyncStr} &nbsp;&nbsp; Total storage size: ${totalStr}`;
   } catch(e) {}
 }
 
@@ -1362,6 +1383,14 @@ def main():
     print(f"✅ iPod Manager running at {url}")
     print(f"   iPod path: {ipod_path}")
     print("   Press Ctrl+C to stop.")
+
+    # Register clean shutdown
+    atexit.register(cleanup_staging, ipod_path)
+    
+    def signal_handler(sig, frame):
+        sys.exit(0)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     # Open browser after short delay
     threading.Timer(0.8, lambda: webbrowser.open(url)).start()
