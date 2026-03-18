@@ -554,7 +554,7 @@ class Playlist(Record):
                 text = os.path.splitext(os.path.basename(filename))[0]
             else:
                 # Read the playlist file
-                with open(filename, 'r', errors="replace") as f:
+                with open(filename, 'r', encoding='utf-8', errors="replace") as f:
                     data = f.readlines()
 
                 extension = os.path.splitext(filename)[1].lower()
