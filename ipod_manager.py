@@ -66,75 +66,10 @@ import time
 
 STAGING_FOLDER = '.staging'  # hidden folder inside iPod_Control/Music; cleared on startup/exit
 
-# ─── Duplicate cache (populated in background thread) ──────────────────────────
-_dup_cache = {
-    'path_to_dups': {},  # full_path -> [other full_paths]
-    'last_run': 0,
-    'running': False,
-    'lock': threading.Lock(),
-}
-_DUP_CACHE_TTL = 60  # seconds between rescans
+# ─── Duplicate cache (populated synchronously but cached aggressively) ─────────
+_dup_cache = None
+_metadata_cache = {}  # { filepath: (mtime, title, artist, album, duration_str) }
 
-def _run_dup_scan(ipod_path):
-    """Build the duplicate map in a background thread and store in _dup_cache."""
-    with _dup_cache['lock']:
-        if _dup_cache['running']:
-            return
-        _dup_cache['running'] = True
-    try:
-        music_dir = os.path.join(ipod_path, 'iPod_Control', 'Music')
-        by_hash = {}
-        for dirpath, dirnames, filenames in os.walk(music_dir):
-            dirnames[:] = [d for d in dirnames if not d.startswith('.')]
-            for filename in filenames:
-                if filename.startswith('.'):
-                    continue
-                ext = os.path.splitext(filename)[1].lower()
-                if ext in AUDIO_EXT:
-                    full = os.path.join(dirpath, filename)
-                    digest = md5_of_file(full)
-                    if digest:
-                        by_hash.setdefault(digest, []).append(full)
-        path_to_dups = {}
-        for paths in by_hash.values():
-            if len(paths) > 1:
-                for p in paths:
-                    path_to_dups[p] = [x for x in paths if x != p]
-        with _dup_cache['lock']:
-            _dup_cache['path_to_dups'] = path_to_dups
-            _dup_cache['last_run'] = time.time()
-        logger.info(f'Duplicate scan complete: {len(path_to_dups)} duplicate file(s) found.')
-    except Exception as e:
-        logger.error(f'Duplicate scan error: {e}')
-    finally:
-        with _dup_cache['lock']:
-            _dup_cache['running'] = False
-
-def schedule_dup_scan(ipod_path, force=False):
-    """Kick off a background dup scan if the cache is stale (or forced)."""
-    with _dup_cache['lock']:
-        stale = (time.time() - _dup_cache['last_run']) > _DUP_CACHE_TTL
-        running = _dup_cache['running']
-    if (stale or force) and not running:
-        t = threading.Thread(target=_run_dup_scan, args=(ipod_path,), daemon=True)
-        t.start()
-
-def get_dup_map():
-    """Return the current (possibly stale) duplicate map without blocking."""
-    with _dup_cache['lock']:
-        return dict(_dup_cache['path_to_dups'])
-
-def invalidate_dup_cache():
-    """Force the next songs load to trigger a fresh duplicate scan."""
-    with _dup_cache['lock']:
-        _dup_cache['last_run'] = 0
-
-def cleanup_staging(ipod_path):
-    """Remove the staging folder and everything inside it."""
-    staging = os.path.join(ipod_path, 'iPod_Control', 'Music', STAGING_FOLDER)
-    if os.path.isdir(staging):
-        shutil.rmtree(staging, ignore_errors=True)
-        logger.info('Staging folder cleared.')
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 def format_duration(seconds):
     if not seconds: return "00:00"
@@ -154,11 +89,35 @@ def md5_of_file(path, chunk=1 << 20):
     except Exception:
         return None
     return h.hexdigest()
-_metadata_cache = {}  # { filepath: (mtime, title, artist, album, duration_str) }
+
+def find_duplicates(ipod_path):
+    """Scan all audio files and return a dict: md5 -> list of full paths.
+    Only entries with >1 path are duplicates. Cached in memory until invalidated."""
+    global _dup_cache
+    if _dup_cache is not None:
+        return _dup_cache
+
+    logger.info("Scanning for duplicates (this may take a moment)...")
+    music_dir = os.path.join(ipod_path, 'iPod_Control', 'Music')
+    by_hash = {}
+    for dirpath, dirnames, filenames in os.walk(music_dir):
+        dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+        for filename in filenames:
+            if filename.startswith('.'):
+                continue
+            ext = os.path.splitext(filename)[1].lower()
+            if ext in AUDIO_EXT:
+                full = os.path.join(dirpath, filename)
+                digest = md5_of_file(full)
+                if digest:
+                    by_hash.setdefault(digest, []).append(full)
+    
+    _dup_cache = {k: v for k, v in by_hash.items() if len(v) > 1}
+    return _dup_cache
 
 def get_song_info(path):
     """Read ID3/M4A tags and return title, artist, album, duration.
-    Cached aggressively to avoid USB thrashing."""
+    Cached aggressively in memory to avoid USB thrashing."""
     try:
         mtime = os.path.getmtime(path)
     except OSError:
@@ -184,15 +143,29 @@ def get_song_info(path):
                     duration_str = format_duration(audio.info.length)
         except Exception:
             pass
-            
+
     _metadata_cache[path] = (mtime, title, artist, album, duration_str)
     return title, artist, album, duration_str
+
+def cleanup_staging(ipod_path):
+    """Remove the staging folder and invalidate duplicate cache."""
+    global _dup_cache
+    _dup_cache = None
+    
+    staging = os.path.join(ipod_path, 'iPod_Control', 'Music', STAGING_FOLDER)
+    if os.path.isdir(staging):
+        shutil.rmtree(staging, ignore_errors=True)
+        logger.info('Staging folder cleared.')
 
 def scan_songs(ipod_path):
     """Walk the iPod and return list of song dicts with staged + duplicate flags.
     Duplicate detection uses a background-thread cache so this never blocks."""
     staging_dir = os.path.join(ipod_path, 'iPod_Control', 'Music', STAGING_FOLDER)
-    path_to_dups = get_dup_map()
+    # Use cached dup map (non-blocking) and kick off a refresh if stale
+    path_to_dups_map = {}
+    for md5_hash, paths in find_duplicates(ipod_path).items():
+        for p in paths:
+            path_to_dups_map[p] = [x for x in paths if x != p]
 
     songs = []
     music_dir = os.path.join(ipod_path, 'iPod_Control', 'Music')
@@ -213,7 +186,7 @@ def scan_songs(ipod_path):
                              full.startswith(staging_dir + os.sep))
                 dup_rels = [
                     os.path.relpath(d, ipod_path).replace(os.sep, '/')
-                    for d in path_to_dups.get(full, [])
+                    for d in path_to_dups_map.get(full, [])
                 ]
                 songs.append({
                     'pos': pos,
@@ -228,10 +201,6 @@ def scan_songs(ipod_path):
                     'duplicate_of': dup_rels,
                 })
                 pos += 1
-                
-    # Kick off the background duplicate scan AFTER we've finished reading all ID3 tags
-    # to avoid aggressive disk head contention on the USB drive.
-    schedule_dup_scan(ipod_path)
     return songs
 
 def scan_playlists(ipod_path):
@@ -402,6 +371,8 @@ class Handler(BaseHTTPRequestHandler):
                         logger.info(f'Deleted song: {rel_path}')
                     except Exception as e:
                         logger.error(f'Error deleting {rel_path}: {e}')
+            global _dup_cache
+            _dup_cache = None # Invalidate duplicate cache
             self.send_json({'ok': True, 'deleted': deleted_count})
 
         elif path == '/api/upload':
@@ -440,6 +411,9 @@ class Handler(BaseHTTPRequestHandler):
                 logger.info(f'Staged (pending sync): {fname}')
                 rel = os.path.relpath(dest, self.ipod_path).replace(os.sep, '/')
                 added.append(rel)
+            
+            global _dup_cache
+            _dup_cache = None  # invalidate duplicate cache so new staged files are scanned
             self.send_json({'ok': True, 'added': added})
 
         elif path == '/api/sync':
