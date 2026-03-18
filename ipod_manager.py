@@ -333,6 +333,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
+        global _dup_cache
         parsed = urlparse(self.path)
         path = parsed.path
 
@@ -371,7 +372,6 @@ class Handler(BaseHTTPRequestHandler):
                         logger.info(f'Deleted song: {rel_path}')
                     except Exception as e:
                         logger.error(f'Error deleting {rel_path}: {e}')
-            global _dup_cache
             _dup_cache = None # Invalidate duplicate cache
             self.send_json({'ok': True, 'deleted': deleted_count})
 
@@ -412,7 +412,6 @@ class Handler(BaseHTTPRequestHandler):
                 rel = os.path.relpath(dest, self.ipod_path).replace(os.sep, '/')
                 added.append(rel)
             
-            global _dup_cache
             _dup_cache = None  # invalidate duplicate cache so new staged files are scanned
             self.send_json({'ok': True, 'added': added})
 
