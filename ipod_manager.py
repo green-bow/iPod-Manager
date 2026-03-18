@@ -13,6 +13,7 @@ import threading
 import webbrowser
 import io
 import re
+import hashlib
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
 import cgi
@@ -61,12 +62,52 @@ AUDIO_EXT = ('.mp3', '.m4a', '.m4b', '.m4p', '.aa', '.wav')
 PLAYLIST_EXT = ('.m3u', '.m3u8')
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SYNC_SCRIPT = os.path.join(SCRIPT_DIR, 'ipod-shuffle-4g.py')
+STAGING_FOLDER = '.staging'  # hidden folder inside iPod_Control/Music; cleared on startup/exit
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 def format_duration(seconds):
     if not seconds: return "00:00"
     m, s = divmod(int(seconds), 60)
     return f"{m:02d}:{s:02d}"
+
+def md5_of_file(path, chunk=1 << 20):
+    """Return MD5 hex digest of a file's contents."""
+    h = hashlib.md5()
+    try:
+        with open(path, 'rb') as f:
+            while True:
+                block = f.read(chunk)
+                if not block:
+                    break
+                h.update(block)
+    except Exception:
+        return None
+    return h.hexdigest()
+
+def find_duplicates(ipod_path):
+    """Scan all audio files and return a dict: md5 -> list of full paths.
+    Only entries with >1 path are duplicates."""
+    music_dir = os.path.join(ipod_path, 'iPod_Control', 'Music')
+    by_hash = {}
+    for dirpath, dirnames, filenames in os.walk(music_dir):
+        dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+        for filename in filenames:
+            if filename.startswith('.'):
+                continue
+            ext = os.path.splitext(filename)[1].lower()
+            if ext in AUDIO_EXT:
+                full = os.path.join(dirpath, filename)
+                digest = md5_of_file(full)
+                if digest:
+                    by_hash.setdefault(digest, []).append(full)
+    return {k: v for k, v in by_hash.items() if len(v) > 1}
+
+def cleanup_staging(ipod_path):
+    """Remove the staging folder and everything inside it."""
+    staging = os.path.join(ipod_path, 'iPod_Control', 'Music', STAGING_FOLDER)
+    if os.path.isdir(staging):
+        shutil.rmtree(staging, ignore_errors=True)
+        logger.info('Staging folder cleared.')
 
 def get_song_info(path):
     """Read ID3/M4A tags and return title, artist, album, duration."""
@@ -88,15 +129,22 @@ def get_song_info(path):
     return title, artist, album, duration_str
 
 def scan_songs(ipod_path):
-    """Walk the iPod and return list of song dicts."""
+    """Walk the iPod and return list of song dicts with staged + duplicate flags."""
+    staging_dir = os.path.join(ipod_path, 'iPod_Control', 'Music', STAGING_FOLDER)
+    dup_map = find_duplicates(ipod_path)  # md5 -> [paths]
+    # Build reverse lookup: full_path -> list of other duplicate paths
+    path_to_dups = {}
+    for paths in dup_map.values():
+        for p in paths:
+            path_to_dups[p] = [x for x in paths if x != p]
+
     songs = []
     music_dir = os.path.join(ipod_path, 'iPod_Control', 'Music')
-    speakable_dir = os.path.join(ipod_path, 'iPod_Control', 'Speakable')
     pos = 1
     for dirpath, dirnames, filenames in os.walk(music_dir):
         dirnames.sort()
-        # skip hidden directories
-        dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+        # skip hidden directories (but DO descend into .staging)
+        dirnames[:] = [d for d in dirnames if not d.startswith('.') or d == STAGING_FOLDER]
         for filename in sorted(filenames):
             if filename.startswith('.'):
                 continue
@@ -104,8 +152,9 @@ def scan_songs(ipod_path):
             if ext in AUDIO_EXT:
                 full = os.path.join(dirpath, filename)
                 title, artist, album, duration = get_song_info(full)
-                # iPod-relative path (forward slashes)
                 rel = os.path.relpath(full, ipod_path).replace(os.sep, '/')
+                is_staged = os.path.commonpath([full, staging_dir]) == staging_dir if os.path.isdir(staging_dir) else False
+                dup_rels = [os.path.relpath(d, ipod_path).replace(os.sep, '/') for d in path_to_dups.get(full, [])]
                 songs.append({
                     'pos': pos,
                     'path': rel,
@@ -115,6 +164,8 @@ def scan_songs(ipod_path):
                     'album': album,
                     'duration': duration,
                     'filename': filename,
+                    'staged': is_staged,
+                    'duplicate_of': dup_rels,
                 })
                 pos += 1
     return songs
@@ -290,7 +341,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({'ok': True, 'deleted': deleted_count})
 
         elif path == '/api/upload':
-            # Multipart file upload
+            # Multipart file upload — staged only, NOT synced until user presses Sync
             content_type = self.headers.get('Content-Type', '')
             ctype, pdict = cgi.parse_header(content_type)
             if ctype != 'multipart/form-data':
@@ -302,13 +353,12 @@ class Handler(BaseHTTPRequestHandler):
             pdict['boundary'] = pdict['boundary'].encode('ascii')
             length = int(self.headers.get('Content-Length', 0))
             raw = self.rfile.read(length)
-            # Parse using cgi.parse_multipart
             pdict['CONTENT-LENGTH'] = length
             fields = cgi.parse_multipart(io.BytesIO(raw), pdict)
             added = []
-            dest_dir = os.path.join(self.ipod_path, 'iPod_Control', 'Music', 'Added')
+            # Stage to hidden .staging folder — auto-deleted on exit/startup
+            dest_dir = os.path.join(self.ipod_path, 'iPod_Control', 'Music', STAGING_FOLDER)
             os.makedirs(dest_dir, exist_ok=True)
-            # 'file' field contains file data; 'filename' field contains name
             filenames = fields.get('filename', [])
             filedata = fields.get('file', [])
             for fname, fdata in zip(filenames, filedata):
@@ -316,7 +366,6 @@ class Handler(BaseHTTPRequestHandler):
                 if not fname:
                     continue
                 dest = os.path.join(dest_dir, fname)
-                # Avoid overwriting
                 base, ext = os.path.splitext(fname)
                 counter = 1
                 while os.path.exists(dest):
@@ -324,7 +373,7 @@ class Handler(BaseHTTPRequestHandler):
                     counter += 1
                 with open(dest, 'wb') as f:
                     f.write(fdata if isinstance(fdata, bytes) else fdata.encode())
-                logger.info(f'Uploaded: {fname}')
+                logger.info(f'Staged (pending sync): {fname}')
                 rel = os.path.relpath(dest, self.ipod_path).replace(os.sep, '/')
                 added.append(rel)
             self.send_json({'ok': True, 'added': added})
@@ -345,14 +394,52 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
-            write_chunk('=== Generating Windows TTS voiceover for playlists ===\n')
-            # Generate voiceover WAVs for each playlist using Windows SAPI
+            # ── Step 1: commit staged files to permanent locations ──────────────
+            staging_dir = os.path.join(self.ipod_path, 'iPod_Control', 'Music', STAGING_FOLDER)
+            if os.path.isdir(staging_dir):
+                staged_files = [
+                    f for f in os.listdir(staging_dir)
+                    if os.path.splitext(f)[1].lower() in AUDIO_EXT
+                ]
+                if staged_files:
+                    write_chunk(f'=== Committing {len(staged_files)} staged song(s) to iPod ===\n')
+                    for fname in staged_files:
+                        src = os.path.join(staging_dir, fname)
+                        # Determine destination folder from metadata
+                        artist, album = 'Unknown Artist', 'Unknown Album'
+                        if MUTAGEN:
+                            try:
+                                audio = mutagen.File(src, easy=True)
+                                if audio:
+                                    artist = audio.get('artist', [artist])[0]
+                                    album = audio.get('album', [album])[0]
+                            except Exception:
+                                pass
+                        # Sanitise folder names for FAT filesystem
+                        def safe(s): return re.sub(r'[<>:"/\\|?*]', '_', s).strip() or 'Unknown'
+                        dest_dir_song = os.path.join(
+                            self.ipod_path, 'iPod_Control', 'Music',
+                            safe(artist), safe(album)
+                        )
+                        os.makedirs(dest_dir_song, exist_ok=True)
+                        dest = os.path.join(dest_dir_song, fname)
+                        base, ext = os.path.splitext(fname)
+                        counter = 1
+                        while os.path.exists(dest):
+                            dest = os.path.join(dest_dir_song, f'{base}_{counter}{ext}')
+                            counter += 1
+                        shutil.move(src, dest)
+                        write_chunk(f'  ✅ {fname} → {os.path.relpath(dest, self.ipod_path)}\n')
+                    # Clean up empty staging directory
+                    cleanup_staging(self.ipod_path)
+
+            # ── Step 2: generate voiceover WAVs ──────────────────────────────────
+            write_chunk('\n=== Generating Windows TTS voiceover for playlists ===\n')
             speakable_playlists = os.path.join(self.ipod_path, 'iPod_Control', 'Speakable', 'Playlists')
             speakable_tracks = os.path.join(self.ipod_path, 'iPod_Control', 'Speakable', 'Tracks')
             os.makedirs(speakable_playlists, exist_ok=True)
             os.makedirs(speakable_tracks, exist_ok=True)
 
-            import hashlib
             playlists = scan_playlists(self.ipod_path)
             for pl in playlists:
                 name = pl['name']
@@ -497,10 +584,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .toast { background: #333; color: #fff; padding: 10px 16px; border-radius: 6px; font-size: 12px; animation: slideIn 0.25s ease; box-shadow: 0 4px 12px rgba(0,0,0,0.2); }
   @keyframes slideIn { from { opacity:0; transform: translateY(20px); } to { opacity:1; transform: translateY(0); } }
   
+  /* Row state highlighting */
+  .song-table tr.row-staged td { background: #fff8e1 !important; }
+  .song-table tr.row-staged:hover td { background: #fff3cd !important; }
+  .song-table tr.row-duplicate td { background: #fff0f0 !important; }
+  .song-table tr.row-duplicate:hover td { background: #ffe0e0 !important; }
+  .song-table tr.row-staged-dup td { background: #fff0e0 !important; }
+  .song-table tr.row-staged-dup:hover td { background: #ffe8cc !important; }
+  .song-table tr.selected td { background: var(--accent-light) !important; }
+  .row-badge { display:inline-block; font-size:9px; padding:1px 5px; border-radius:3px; margin-left:6px; font-weight:600; vertical-align:middle; }
+  .badge-staged { background:#ffb300; color:#fff; }
+  .badge-dup { background:#ef4444; color:#fff; }
+
+  /* Legend */
+  .legend { display:flex; gap:14px; align-items:center; padding:5px 16px; font-size:11px; color:var(--text2); border-bottom:1px solid var(--border); background:#fafafa; flex-shrink:0; }
+  .legend-dot { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:4px; }
+  .legend-staged { background:#ffb300; }
+  .legend-dup { background:#ef4444; }
+  .legend-both { background:#ff7043; }
+  
   /* Utilities */
   .empty { padding: 40px; text-align: center; color: var(--text2); font-size: 13px; }
-  .hidden { display: none !important; }
-</style>
+  .hidden { display: none !important; }</style>
 </head>
 <body>
 
@@ -509,7 +614,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <span style="font-size:20px;">🎶</span> iPod Manager
   </div>
   <div class="header-actions">
-    <button class="btn" onclick="document.getElementById('fileInput').click()">📥 Upload Songs</button>
+    <button class="btn" onclick="document.getElementById('fileInput').click()">➕ Add Songs</button>
     <input type="file" id="fileInput" multiple accept=".mp3,.m4a,.m4b,.wav" style="display:none" onchange="handleFiles(this.files)">
     <button class="btn" onclick="refresh()">↻ Refresh</button>
     <button class="btn btn-primary" id="syncBtn" onclick="startSync()">▶ Sync to iPod</button>
@@ -552,7 +657,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     
     <div id="uploadStatus" style="font-size:12px;padding:8px 16px;background:var(--accent-light);color:#d84315;display:none;"></div>
     
-
+    <!-- Legend strip -->
+    <div class="legend" id="legendStrip" style="display:none;">
+      <span><span class="legend-dot legend-staged"></span>Pending sync</span>
+      <span><span class="legend-dot legend-dup"></span>Duplicate</span>
+      <span><span class="legend-dot legend-both"></span>Both</span>
+    </div>
 
     <div class="table-container" id="songList"></div>
 
@@ -731,10 +841,16 @@ function renderSongs() {
   if (!filteredSongs.length) {
     el.innerHTML = '<div class="empty">No songs found in this view.</div>';
     document.getElementById('selectionCount').textContent = '0 selected';
+    document.getElementById('legendStrip').style.display = 'none';
     return;
   }
   
   const getSortIcon = (col) => sortCol === col ? (sortDesc ? ' ▼' : ' ▲') : '';
+
+  // Show legend if any staged or duplicate rows exist
+  const hasStaged = filteredSongs.some(s => s.staged);
+  const hasDup = filteredSongs.some(s => s.duplicate_of && s.duplicate_of.length > 0);
+  document.getElementById('legendStrip').style.display = (hasStaged || hasDup) ? 'flex' : 'none';
 
   let html = `<table class="song-table">
     <thead>
@@ -750,17 +866,30 @@ function renderSongs() {
     </thead>
     <tbody>`;
     
-  html += filteredSongs.map((s, idx) => `
-    <tr class="${selectedPaths.has(s.path)?'selected':''}" onclick="toggleSong('${escHtml(s.path)}', event, ${idx})" data-path="${escHtml(s.path)}">
+  html += filteredSongs.map((s, idx) => {
+    const isStaged = s.staged;
+    const isDup = s.duplicate_of && s.duplicate_of.length > 0;
+    let rowClass = selectedPaths.has(s.path) ? 'selected' : '';
+    if (!selectedPaths.has(s.path)) {
+      if (isStaged && isDup) rowClass = 'row-staged-dup';
+      else if (isStaged) rowClass = 'row-staged';
+      else if (isDup) rowClass = 'row-duplicate';
+    }
+    const badges = (isStaged ? '<span class="row-badge badge-staged">PENDING</span>' : '') +
+                   (isDup    ? '<span class="row-badge badge-dup">DUP</span>'     : '');
+    const dupTitle = isDup ? ` title="Duplicate of: ${escHtml(s.duplicate_of.join(', '))}"` : '';
+    return `
+    <tr class="${rowClass}" onclick="toggleSong('${escHtml(s.path)}', event, ${idx})" data-path="${escHtml(s.path)}">
       <td class="col-type">🎵</td>
       <td class="col-pos">${s.pos || ''}</td>
-      <td class="col-title" title="${escHtml(s.title)}">${escHtml(s.title)}</td>
+      <td class="col-title" title="${escHtml(s.title)}">${escHtml(s.title)}${badges}</td>
       <td class="col-artist" title="${escHtml(s.artist)}">${escHtml(s.artist)}</td>
-      <td class="col-album" title="${escHtml(s.album)}">${escHtml(s.album)}</td>
+      <td class="col-album"${dupTitle}>${escHtml(s.album)}</td>
       <td class="col-rating">★★★★★</td>
       <td class="col-time">${escHtml(s.duration) || '00:00'}</td>
     </tr>
-  `).join('');
+  `;
+  }).join('');
   
   html += `</tbody></table>`;
   el.innerHTML = html;
@@ -978,7 +1107,8 @@ async function deleteSelectedSongsFromIpod() {
 async function handleFiles(files) {
   if (!files.length) return;
   const status = document.getElementById('uploadStatus');
-  status.innerHTML = `<span style="color:var(--yellow)">⏳ Uploading ${files.length} file(s)…</span>`;
+  status.style.display = 'block';
+  status.innerHTML = `<span style="color:#666">⏳ Staging ${files.length} file(s)…</span>`;
 
   const fd = new FormData();
   for (const f of files) {
@@ -990,12 +1120,12 @@ async function handleFiles(files) {
     const res = await fetch('/api/upload', { method: 'POST', body: fd });
     const data = await res.json();
     if (data.ok) {
-      status.innerHTML = `<span style="color:var(--green)">✅ Added ${data.added.length} file(s) to iPod. Click Refresh then Sync.</span>`;
-      toast(`Uploaded ${data.added.length} file(s)`, 'success');
+      status.innerHTML = `<span style="color:#d97706">🟡 ${data.added.length} file(s) staged — they will be copied to your iPod when you press Sync.</span>`;
+      toast(`${data.added.length} song(s) queued for sync`, 'success');
       await loadSongs();
       loadStorage();
     } else {
-      status.innerHTML = `<span style="color:var(--red)">❌ Upload failed</span>`;
+      status.innerHTML = `<span style="color:var(--red)">❌ Staging failed</span>`;
     }
   } catch(e) {
     status.innerHTML = `<span style="color:var(--red)">❌ Error: ${e.message}</span>`;
@@ -1027,6 +1157,8 @@ async function startSync() {
   syncBar.style.background = '#0ea5e9';
   syncBar.style.width = '0%';
   syncText.textContent = 'Initializing sync...';
+  // Hide the upload status banner now that we're syncing
+  document.getElementById('uploadStatus').style.display = 'none';
 
   try {
     const res = await fetch('/api/sync', { method: 'POST' });
@@ -1035,7 +1167,6 @@ async function startSync() {
     
     let simulatedProgress = 0;
     const progressInterval = setInterval(() => {
-      // Fake progress until completion since the sync script doesn't output precise percentages
       if (simulatedProgress < 90) {
         simulatedProgress += Math.random() * 5;
         syncBar.style.width = `${Math.min(90, simulatedProgress)}%`;
@@ -1054,8 +1185,9 @@ async function startSync() {
     
     clearInterval(progressInterval);
     syncBar.style.width = '100%';
-    syncBar.style.background = '#10b981'; // Green on success
+    syncBar.style.background = '#10b981';
     syncText.textContent = '✅ Sync complete! Safely eject your iPod.';
+    await loadSongs(); // refresh so staged rows turn back to normal
     
     setTimeout(() => {
         syncStatusEl.style.display = 'none';
@@ -1140,6 +1272,9 @@ def main():
     if not MUTAGEN:
         print("Warning: mutagen not installed. Song titles/artists won't be read from ID3 tags.")
 
+    # Clean up any leftover staging from a previous crash
+    cleanup_staging(ipod_path)
+
     Handler.ipod_path = ipod_path
 
     server = HTTPServer(('127.0.0.1', PORT), Handler)
@@ -1155,6 +1290,10 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down.")
+    finally:
+        # Always delete staged files if the user never pressed Sync
+        cleanup_staging(ipod_path)
+        print("Staged files cleared. Goodbye.")
 
 
 if __name__ == '__main__':
