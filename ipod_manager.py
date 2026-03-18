@@ -16,7 +16,13 @@ import re
 import hashlib
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
+from socketserver import ThreadingMixIn
 import cgi
+import time
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
 
 try:
     import mutagen
@@ -160,16 +166,21 @@ def cleanup_staging(ipod_path):
 def scan_songs(ipod_path):
     """Walk the iPod and return list of song dicts with staged + duplicate flags.
     Duplicate detection uses a background-thread cache so this never blocks."""
+    start_total = time.time()
+    logger.info("Starting song scan...")
     staging_dir = os.path.join(ipod_path, 'iPod_Control', 'Music', STAGING_FOLDER)
     # Use cached dup map (non-blocking) and kick off a refresh if stale
+    s_dup = time.time()
     path_to_dups_map = {}
     for md5_hash, paths in find_duplicates(ipod_path).items():
         for p in paths:
             path_to_dups_map[p] = [x for x in paths if x != p]
+    logger.info(f"Duplicate scan check took {time.time()-s_dup:.2f}s")
 
     songs = []
     music_dir = os.path.join(ipod_path, 'iPod_Control', 'Music')
     pos = 1
+    s_walk = time.time()
     for dirpath, dirnames, filenames in os.walk(music_dir):
         dirnames.sort()
         # Walk hidden .staging but skip other hidden dirs
@@ -201,6 +212,8 @@ def scan_songs(ipod_path):
                     'duplicate_of': dup_rels,
                 })
                 pos += 1
+    logger.info(f"Directory walk + ID3 check took {time.time()-s_walk:.2f}s")
+    logger.info(f"Total song scan took {time.time()-start_total:.2f}s for {len(songs)} songs.")
     return songs
 
 def scan_playlists(ipod_path):
@@ -585,7 +598,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .nav-icon { width: 20px; opacity: 0.6; }
   
   /* Main View */
-  .main-view { flex: 1; display: flex; flex-direction: column; min-width: 0; background: #fff; }
+  .main-view { flex: 1; display: flex; flex-direction: column; min-width: 0; background: #fff; position: relative; }
+  .main-view.drag-over { background: #fff8e1 !important; }
+  .main-view.drag-over::after {
+    content: "DROP TO ADD SONGS";
+    position: absolute; top:0; left:0; right:0; bottom:0;
+    background: rgba(255,248,225,0.8);
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; color: var(--accent); font-size: 20px;
+    border: 3px dashed var(--accent); z-index: 1000;
+    pointer-events: none;
+  }
   .toolbar { padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; background: #fcfcfc; }
   .search-input { border: 1px solid var(--border); border-radius: 12px; padding: 4px 10px; font-size: 12px; outline: none; width: 200px; }
   .search-input:focus { border-color: var(--accent); }
@@ -684,7 +707,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 
   <!-- Main View -->
-  <div class="main-view">
+  <div class="main-view" id="uploadZone">
     <div class="toolbar">
       <div id="viewTitle" style="font-weight:600;font-size:14px;">Song Library</div>
       <div style="display:flex;gap:8px;">
@@ -738,13 +761,24 @@ let deleteMode = false;
 let pivotIndex = -1;
 let sortCol = 'pos';
 let sortDesc = false;
+let isLoading = false;
 
-// ─── Data loading ───────────────────────────────────────────────────────────
 async function loadSongs() {
-  const res = await fetch('/api/songs');
-  allSongs = await res.json();
-  document.getElementById('nav-library-count').textContent = allSongs.length;
-  filterSongs();
+  isLoading = true;
+  const el = document.getElementById('songList');
+  if (allSongs.length === 0) {
+    el.innerHTML = '<div class="empty">⏳ Loading songs from iPod...</div>';
+  }
+  try {
+    const res = await fetch('/api/songs');
+    allSongs = await res.json();
+    document.getElementById('nav-library-count').textContent = allSongs.length;
+    filterSongs();
+  } catch(e) {
+    el.innerHTML = `<div class="empty" style="color:var(--red)">❌ Error loading songs: ${e.message}</div>`;
+  } finally {
+    isLoading = false;
+  }
 }
 
 async function loadPlaylists() {
@@ -853,6 +887,14 @@ function sortSongs(col) {
 
 function sortAndRenderSongs() {
   filteredSongs.sort((a, b) => {
+    // Primary sort: Highlighted songs (staged or duplicate) always at the top
+    const aHighlighted = a.staged || (a.duplicate_of && a.duplicate_of.length > 0);
+    const bHighlighted = b.staged || (b.duplicate_of && b.duplicate_of.length > 0);
+    
+    if (aHighlighted && !bHighlighted) return -1;
+    if (!aHighlighted && bHighlighted) return 1;
+
+    // Secondary sort: user chosen column
     let valA = a[sortCol] || '';
     let valB = b[sortCol] || '';
     
@@ -876,6 +918,7 @@ function sortAndRenderSongs() {
 function renderSongs() {
   const el = document.getElementById('songList');
   if (!filteredSongs.length) {
+    if (isLoading) return; // Keep the loading message visible
     el.innerHTML = '<div class="empty">No songs found in this view.</div>';
     document.getElementById('selectionCount').textContent = '0 selected';
     document.getElementById('legendStrip').style.display = 'none';
@@ -1314,7 +1357,7 @@ def main():
 
     Handler.ipod_path = ipod_path
 
-    server = HTTPServer(('127.0.0.1', PORT), Handler)
+    server = ThreadedHTTPServer(('127.0.0.1', PORT), Handler)
     url = f'http://localhost:{PORT}'
     print(f"✅ iPod Manager running at {url}")
     print(f"   iPod path: {ipod_path}")
