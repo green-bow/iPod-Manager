@@ -154,10 +154,21 @@ def md5_of_file(path, chunk=1 << 20):
     except Exception:
         return None
     return h.hexdigest()
-
+_metadata_cache = {}  # { filepath: (mtime, title, artist, album, duration_str) }
 
 def get_song_info(path):
-    """Read ID3/M4A tags and return title, artist, album, duration."""
+    """Read ID3/M4A tags and return title, artist, album, duration.
+    Cached aggressively to avoid USB thrashing."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0
+        
+    if path in _metadata_cache:
+        cached_mtime, *cached_data = _metadata_cache[path]
+        if cached_mtime == mtime:
+            return tuple(cached_data)
+
     title = os.path.splitext(os.path.basename(path))[0]
     artist = ''
     album = ''
@@ -173,14 +184,14 @@ def get_song_info(path):
                     duration_str = format_duration(audio.info.length)
         except Exception:
             pass
+            
+    _metadata_cache[path] = (mtime, title, artist, album, duration_str)
     return title, artist, album, duration_str
 
 def scan_songs(ipod_path):
     """Walk the iPod and return list of song dicts with staged + duplicate flags.
     Duplicate detection uses a background-thread cache so this never blocks."""
     staging_dir = os.path.join(ipod_path, 'iPod_Control', 'Music', STAGING_FOLDER)
-    # Use cached dup map (non-blocking) and kick off a refresh if stale
-    schedule_dup_scan(ipod_path)
     path_to_dups = get_dup_map()
 
     songs = []
@@ -217,6 +228,10 @@ def scan_songs(ipod_path):
                     'duplicate_of': dup_rels,
                 })
                 pos += 1
+                
+    # Kick off the background duplicate scan AFTER we've finished reading all ID3 tags
+    # to avoid aggressive disk head contention on the USB drive.
+    schedule_dup_scan(ipod_path)
     return songs
 
 def scan_playlists(ipod_path):
